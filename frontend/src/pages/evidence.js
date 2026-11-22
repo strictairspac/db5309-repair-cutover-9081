@@ -8,20 +8,28 @@ export function evidencePage(state, identity) {
   const current = state.evidence.find(row=>row.id===identity) || state.evidence[0];
   if (!current) return heading(topic.modules[3]) + '<p class="empty">执行完成后，可查看、复核和导出证据。</p>';
   const {report} = current;
+  const stale = Boolean(current.staled_at);
   const metrics = Object.entries(report.metrics).map(([label,value])=>`<div><dt>${esc(label)}</dt><dd>${esc(value)}</dd></div>`).join('');
   const sections = report.sections.map(x=>panel(x.title, entries(x.rows))).join('');
-  const review = current.reviewer ? `<p data-testid="reviewed">${esc(current.reviewer)} · ${esc(date(current.reviewed_at))}</p><p>${esc(current.review_note)}</p>`
+  const review = stale
+    ? `<p class="error" data-testid="stale">证据已失效：${esc(current.stale_reason || '源数据已更新')} · ${esc(date(current.staled_at))}</p><p class="note">旧结论不可签署、不可导出，请基于新源数据重新演练。</p>`
+    : current.reviewer ? `<p data-testid="reviewed">${esc(current.reviewer)} · ${esc(date(current.reviewed_at))}</p><p>${esc(current.review_note)}</p>`
     : state.session.role==='reviewer'?'<form id="review-form"><label>复核意见<textarea name="note" maxlength="500" required></textarea></label><button>签署复核</button></form>'
     : '<p class="note">待复核员签署</p>';
-  const history = state.evidence.map(row=>[`<a href="#evidence/${row.id}">执行 ${row.run_id}</a>`, esc(row.report.summary), esc(row.reviewer || '待复核')]);
-  return `${heading(topic.modules[3], report.summary, `<button id="download" data-id="${current.id}">导出证据</button>`)}
-    <div class="spread evidence-top"><dl class="metrics">${metrics}</dl><aside class="brief"><h2>复核签署</h2>${review}<details><summary>结果校验码</summary><code class="digest">${esc(current.digest)}</code></details></aside></div>
+  const history = state.evidence.map(row=>[`<a href="#evidence/${row.id}">执行 ${row.run_id}</a>`,
+    esc(row.report.summary), row.staled_at?'<span class="stale-tag">已失效</span>':esc(row.reviewer || '待复核')]);
+  const download = stale
+    ? `<button id="download" data-id="${current.id}" disabled title="证据已失效，不能导出">导出证据</button>`
+    : `<button id="download" data-id="${current.id}">导出证据</button>`;
+  return `${heading(topic.modules[3], report.summary, download)}
+    <div class="spread evidence-top"><dl class="metrics">${metrics}</dl><aside class="brief"><h2>复核签署</h2>${review}<details><summary>结果校验码与输入指纹</summary><code class="digest">${esc(current.digest)}</code><code class="digest">${esc(report.input_fingerprint || '')}</code></details></aside></div>
+    ${stale ? '<p class="error banner">该验收单对应源数据已更新，页面证据仅作留档，不能混入新验收单。</p>' : ''}
     ${sections}<details><summary>历史证据</summary>${records(['执行','结论','复核'], history)}</details>`;
 }
 
 export function bindEvidence(api, update, fail) {
   const button = document.getElementById('download');
-  if (!button) return;
+  if (!button || button.disabled) return;
   const identity = button.dataset.id;
   button.addEventListener('click', async()=>{
     try {

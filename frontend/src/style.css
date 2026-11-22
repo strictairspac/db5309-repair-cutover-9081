@@ -74,6 +74,10 @@ td { border-top:1px solid var(--line); min-width: 3.3rem; max-width: 35ch; }
 .empty { margin:0; padding:1.3rem; color:var(--muted); background:var(--soft); }
 summary { cursor:pointer; font-weight:600; color:var(--accent-dark); }
 .digest { word-break:break-all; }
+.digest + .digest { margin-top:.4rem; }
+.banner { font-weight:600; }
+.stale-tag { color:oklch(.36 .15 27); background:oklch(.94 .045 26); padding:.05em .55em; border-radius:var(--radius); font-size:.88em; white-space:nowrap; }
+button:disabled { opacity:.55; cursor:not-allowed; }
 @media (min-width: 1280px) { .inspection .panel:has(> pre) { max-width: 65ch; } }
 @media (max-width: 1000px) {
   .workspace { display: block; }

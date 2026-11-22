@@ -1,10 +1,12 @@
 """针渡修衣工时换版的输入契约及切换验收单。"""
 
-from collections import Counter
+from collections import Counter, defaultdict
 from decimal import Decimal
+import hashlib
 import re
 
 from .repair_migration import RepairMigration
+from src.utils.encoding import canonical
 
 
 SPEC = {
@@ -40,6 +42,7 @@ SPEC = {
     "expect": {
         "执行批次": 3, "一致工单": 6, "回填写入": 3, "竞态拦截": 1,
         "未消费事件": 0, "切换门禁": "允许切换",
+        "重复已消费事件": 1, "过期已消费事件": 1, "同版冲突事件": 0,
     },
 }
 
@@ -81,7 +84,18 @@ def validate(payload):
                 seen.add(ticket)
 
 
-def _report(orders, events, batches, races):
+def _trail_rows(journal):
+    trails = defaultdict(list)
+    for row in journal:
+        trails[row["ticket"]].append({
+            "工单号": row["ticket"], "版次": row["revision"], "环节": row["node"],
+            "判定": row["result"], "影子刻度": row["ticks"],
+            "回填批次": row["batch_no"], "事件序号": row["event_seq"],
+        })
+    return [entry for ticket in sorted(trails) for entry in trails[ticket]]
+
+
+def _report(orders, events, batches, races, journal):
     order_counts = Counter(row["status"] for row in orders)
     event_counts = Counter(row["status"] for row in events)
     checks = [
@@ -106,6 +120,10 @@ def _report(orders, events, batches, races):
             "待回填工单": order_counts["待回填"], "不可转换工单": order_counts["不可转换"],
             "影子不一致": order_counts["版次不一致"] + order_counts["刻度不一致"],
             "未消费事件": event_counts["待消费"] + event_counts["同版冲突"],
+            "重复已消费事件": event_counts["重复已消费"],
+            "过期已消费事件": event_counts["过期已消费"],
+            "同版冲突事件": event_counts["同版冲突"],
+            "消费轨迹条目": len(journal),
         },
         "sections": [
             {"title": "切换门禁", "rows": [
@@ -117,6 +135,7 @@ def _report(orders, events, batches, races):
                  "影子刻度": row["shadow_ticks"], "影子版次": row["shadow_revision"], "判定": row["status"]}
                 for row in orders
             ]},
+            {"title": "工单消费轨迹", "rows": _trail_rows(journal)},
             {"title": "分批回填", "rows": batches},
             {"title": "过期快照写入凭据", "rows": races},
             {"title": "双写事件消费", "rows": [
@@ -133,6 +152,9 @@ def solve(payload, engine):
     validate(payload)
     if engine.dialect.name != "postgresql":
         raise ValueError("工时迁移演练需要 PostgreSQL")
+    # Fingerprint of the exact source input. Re-runs carry the same fingerprint, and evidence is
+    # invalidated when the source case no longer hashes to the value recorded on the signed report.
+    input_fingerprint = hashlib.sha256(canonical(payload)).hexdigest()
     migration = RepairMigration(engine)
     migration.install(payload["orders"], payload["events"])
     try:
@@ -148,7 +170,9 @@ def solve(payload, engine):
             batches.append(evidence)
             races.extend(skipped)
             cursor = evidence["最后工单"]
-        orders, events = migration.read_gate()
-        return _report(orders, events, batches, races)
+        orders, events, journal = migration.read_gate()
+        report = _report(orders, events, batches, races, journal)
+        report["input_fingerprint"] = input_fingerprint
+        return report
     finally:
         migration.close()

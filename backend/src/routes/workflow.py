@@ -4,7 +4,7 @@ from sqlalchemy import text
 from src.config.settings import cache, engine
 from src.controllers.workflow import download
 from src.models.tables import audit, cases, evidence, runs
-from src.schemas.workflow import CaseForm, LoginForm, ReviewForm
+from src.schemas.workflow import CaseForm, CasePayloadForm, LoginForm, ReviewForm
 from src.services import domain, workflow
 from src.services.security import current_user, login, operator, reviewer
 
@@ -37,6 +37,12 @@ def list_cases(_=Depends(current_user)):
 @router.post('/cases', status_code=201)
 def create_case(form: CaseForm, actor=Depends(operator)):
     return workflow.make_case(form.title, form.payload, actor)
+
+
+@router.put('/cases/{case_id}')
+def amend_case(case_id: int, form: CasePayloadForm, actor=Depends(operator)):
+    # Updating the source invalidates every prior conclusion derived from the old input.
+    return workflow.update_case(case_id, form.payload, actor)
 
 
 @router.get('/runs')

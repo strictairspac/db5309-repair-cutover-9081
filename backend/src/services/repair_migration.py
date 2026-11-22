@@ -12,6 +12,7 @@ class RepairMigration:
         self.schema = f"gb5309_{uuid4().hex}"
         self.orders = f"{self.schema}.repair_orders"
         self.events = f"{self.schema}.change_events"
+        self.journal = f"{self.schema}.order_journal"
         self.to_ticks = f"{self.schema}.to_ticks"
 
     def install(self, orders, events):
@@ -77,6 +78,32 @@ class RepairMigration:
                     INSERT INTO {self.events} (seq, after_batch, ticket, legacy_hours, revision)
                     VALUES (:seq, :after_batch, :ticket, CAST(:legacy_hours AS numeric), :revision)
                 """), [{**event, "seq": seq} for seq, event in enumerate(events, 1)])
+            # Append-only per-ticket consumption trail. The same schema revision is never updated
+            # in place; every replay classification and every backfill writes one more entry.
+            conn.execute(text(f"""
+                CREATE TABLE {self.journal} (
+                    journal_id bigserial PRIMARY KEY,
+                    ticket text NOT NULL,
+                    revision integer NOT NULL,
+                    node text NOT NULL,
+                    result text NOT NULL,
+                    ticks integer,
+                    batch_no integer,
+                    event_seq integer
+                )
+            """))
+            conn.execute(text(f"""
+                CREATE INDEX order_journal_ticket ON {self.journal} (ticket, revision, journal_id)
+            """))
+            if orders:
+                conn.execute(text(f"""
+                    INSERT INTO {self.journal} (ticket, revision, node, result, ticks, batch_no, event_seq)
+                    SELECT ticket, revision, '立案',
+                           CASE WHEN {self.to_ticks}(legacy_hours) IS NULL
+                                THEN '不可转换' ELSE '影子待回填' END,
+                           {self.to_ticks}(legacy_hours), NULL, NULL
+                    FROM {self.orders}
+                """))
 
     def replay(self, batch_no):
         # The legacy update, the trigger's shadow write, and event acknowledgement commit together.
@@ -94,12 +121,15 @@ class RepairMigration:
                     ON CONFLICT (ticket) DO UPDATE
                     SET legacy_hours = EXCLUDED.legacy_hours, revision = EXCLUDED.revision
                     WHERE target.revision < EXCLUDED.revision
-                    RETURNING revision
-                """), event).scalar_one_or_none()
-                status = "双写已消费"
-                if revision is None:
-                    revision, same_hours = conn.execute(text(f"""
-                        SELECT revision, legacy_hours = :legacy_hours FROM {self.orders}
+                    RETURNING revision, shadow_ticks
+                """), event).first()
+                ticks = revision[1] if revision is not None else None
+                if revision is not None:
+                    revision = revision[0]
+                    status = "双写已消费"
+                else:
+                    revision, same_hours, ticks = conn.execute(text(f"""
+                        SELECT revision, legacy_hours = :legacy_hours, shadow_ticks FROM {self.orders}
                         WHERE ticket = :ticket
                     """), event).one()
                     if revision > event["revision"]:
@@ -110,6 +140,14 @@ class RepairMigration:
                     UPDATE {self.events} SET status = :status, observed_revision = :revision
                     WHERE seq = :seq
                 """), {"status": status, "revision": revision, "seq": event["seq"]})
+                # The trail entry commits in the same transaction as the legacy update and the
+                # trigger's shadow write, so a replayed run can never add a second entry per event.
+                conn.execute(text(f"""
+                    INSERT INTO {self.journal}
+                        (ticket, revision, node, result, ticks, batch_no, event_seq)
+                    VALUES (:ticket, :revision, '双写事件', :result, :ticks, :batch_no, :event_seq)
+                """), {"ticket": event["ticket"], "revision": event["revision"], "result": status,
+                       "ticks": ticks, "batch_no": batch_no, "event_seq": event["seq"]})
 
     def backfill(self, cursor, batch_size, batch_no, replay_due):
         with self.engine.connect().execution_options(isolation_level="READ COMMITTED") as conn, conn.begin():
@@ -125,8 +163,9 @@ class RepairMigration:
             if replay_due:
                 self.replay(batch_no)
             candidates = [dict(row) for row in snapshot if row["ticks"] is not None and row["needs_backfill"]]
-            written = self.write_snapshot(conn, candidates)
-            races = self.race_evidence(conn, batch_no, [row for row in candidates if row["ticket"] not in written])
+            written = self.write_snapshot(conn, candidates, batch_no)
+            races = self.race_evidence(conn, batch_no,
+                                       [row for row in candidates if row["ticket"] not in {w["ticket"] for w in written}])
             return {
                 "批次": batch_no,
                 "起始工单": snapshot[0]["ticket"],
@@ -138,17 +177,26 @@ class RepairMigration:
                 "快照已同步": sum(row["ticks"] is not None and not row["needs_backfill"] for row in snapshot),
             }, races
 
-    def write_snapshot(self, conn, candidates):
+    def write_snapshot(self, conn, candidates, batch_no):
         if not candidates:
-            return set()
-        return set(conn.execute(text(f"""
+            return []
+        written = conn.execute(text(f"""
             UPDATE {self.orders} AS target
             SET shadow_ticks = snapshot.ticks, shadow_revision = snapshot.revision
             FROM jsonb_to_recordset(CAST(:snapshot AS jsonb)) AS snapshot(ticket text, revision integer, ticks integer)
             WHERE target.ticket = snapshot.ticket AND target.revision = snapshot.revision
               AND (target.shadow_revision IS NULL OR target.shadow_revision < snapshot.revision)
-            RETURNING target.ticket
-        """), {"snapshot": json.dumps(candidates)}).scalars())
+            RETURNING target.ticket, snapshot.revision, snapshot.ticks
+        """), {"snapshot": json.dumps(candidates)}).mappings().all()
+        # Only the rows UPDATE ... RETURNING actually touched get a backfill trail entry.
+        conn.execute(text(f"""
+            INSERT INTO {self.journal}
+                (ticket, revision, node, result, ticks, batch_no, event_seq)
+            SELECT ticket, revision, '分批回填', '回填写入', ticks, :batch_no, NULL
+            FROM jsonb_to_recordset(CAST(:written AS jsonb))
+                AS written(ticket text, revision integer, ticks integer)
+        """), {"written": json.dumps([dict(row) for row in written]), "batch_no": batch_no})
+        return [dict(row) for row in written]
 
     def race_evidence(self, conn, batch_no, skipped):
         if not skipped:
@@ -158,7 +206,7 @@ class RepairMigration:
             WHERE ticket = ANY(CAST(:tickets AS text[]))
         """), {"tickets": [row["ticket"] for row in skipped]}).mappings()
         by_ticket = {row["ticket"]: row for row in current}
-        return [{
+        races = [{
             "批次": batch_no,
             "工单号": row["ticket"],
             "快照版次": row["revision"],
@@ -168,6 +216,16 @@ class RepairMigration:
             "影子版次": by_ticket[row["ticket"]]["shadow_revision"],
             "保留刻度": by_ticket[row["ticket"]]["shadow_ticks"],
         } for row in skipped]
+        # Intercepted snapshots stay traceable too: the stale revision is preserved as a trail
+        # entry alongside the retained shadow value instead of being silently dropped.
+        conn.execute(text(f"""
+            INSERT INTO {self.journal}
+                (ticket, revision, node, result, ticks, batch_no, event_seq)
+            SELECT ticket, revision, '分批回填', '快照拦截', ticks, :batch_no, NULL
+            FROM jsonb_to_recordset(CAST(:skipped AS jsonb))
+                AS skipped(ticket text, revision integer, ticks integer)
+        """), {"skipped": json.dumps(skipped), "batch_no": batch_no})
+        return races
 
     def read_gate(self):
         # Check the source, shadow and event queue against a single committed snapshot.
@@ -188,7 +246,14 @@ class RepairMigration:
                        revision, status, observed_revision
                 FROM {self.events} ORDER BY seq
             """)).mappings().all()
-            return orders, events
+            # Per-ticket trail ordered by revision (then append order), so each ticket's
+            # consumption history can be replayed from the first filed revision to the latest.
+            journal = conn.execute(text(f"""
+                SELECT journal_id, ticket, revision, node, result, ticks, batch_no, event_seq
+                FROM {self.journal}
+                ORDER BY ticket, revision, journal_id
+            """)).mappings().all()
+            return orders, events, journal
 
     def close(self):
         with self.engine.begin() as conn:
